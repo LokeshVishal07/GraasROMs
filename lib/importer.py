@@ -5,9 +5,53 @@ classification and return-trigger logic ported from the original dashboard.
 import datetime as dt
 
 import pandas as pd
+from sqlalchemy.dialects import postgresql, sqlite as sqlite_dialect
 
 from lib.db import get_session, ReturnOrder
 from lib.seed import CHANNEL_BRAND_MAP
+
+# Columns owned by the warehouse team once a return has been reviewed. A
+# re-import (or an accidental double-import) must never overwrite these on
+# an existing row, so they're excluded from the UPDATE side of the upsert.
+_WAREHOUSE_OWNED_COLS = {
+    "inspection_status", "inspection_comment", "inspected_by",
+    "inspected_at", "warehouse", "tracking_number",
+}
+
+
+def _upsert_return_orders(session, mappings, chunk_size=1000):
+    """Insert-or-update ReturnOrder rows in one atomic statement per chunk.
+
+    This replaces a check-then-insert-or-update pattern that raced under
+    concurrent imports (e.g. a double-clicked "Import orders" button, or two
+    people importing at the same time): two runs could both see an empty
+    table and both try to INSERT the same key, and the loser crashed with a
+    UniqueViolation. INSERT ... ON CONFLICT DO UPDATE lets the database
+    resolve that collision atomically instead of us guessing beforehand.
+    """
+    if not mappings:
+        return
+
+    dialect_name = session.get_bind().dialect.name
+    if dialect_name == "postgresql":
+        insert_fn = postgresql.insert
+    elif dialect_name == "sqlite":
+        insert_fn = sqlite_dialect.insert
+    else:
+        # Unknown dialect: fall back to a safe (slower) per-row merge.
+        for m in mappings:
+            session.merge(ReturnOrder(**m))
+        return
+
+    all_cols = [c.name for c in ReturnOrder.__table__.columns if c.name != "key"]
+    update_cols = [c for c in all_cols if c not in _WAREHOUSE_OWNED_COLS]
+
+    for i in range(0, len(mappings), chunk_size):
+        batch = mappings[i:i + chunk_size]
+        stmt = insert_fn(ReturnOrder).values(batch)
+        set_ = {col: getattr(stmt.excluded, col) for col in update_cols}
+        stmt = stmt.on_conflict_do_update(index_elements=["key"], set_=set_)
+        session.execute(stmt)
 
 COLUMN_ALIASES = {
     "channel": ["channel", "CHANNEL"],
@@ -115,11 +159,15 @@ def import_csvs(orders_file, items_file=None, batch_label: str = None) -> dict:
     session = get_session()
     inserted, updated = 0, 0
     try:
-        existing_rows = session.query(ReturnOrder.key, ReturnOrder.inspection_status).all()
-        existing_keys = {k: insp for k, insp in existing_rows}
+        # Snapshot of keys already in the table, used only to report an
+        # approximate inserted/updated split in the success message below.
+        # It is NOT used to decide how each row is written — that decision
+        # is now made atomically by the database itself (see
+        # _upsert_return_orders), so a stale/racing snapshot here can no
+        # longer cause a crash, only a slightly-off count in the UI text.
+        existing_keys = {k for (k,) in session.query(ReturnOrder.key).all()}
 
-        insert_mappings = []
-        update_mappings = []
+        mappings = []
         seen_keys = set()
 
         for row in orders_df.itertuples(index=False):
@@ -155,7 +203,11 @@ def import_csvs(orders_file, items_file=None, batch_label: str = None) -> dict:
 
             item_info = items_lookup.get((channel, order_id), {})
 
-            is_new = key not in existing_keys
+            if key in existing_keys:
+                updated += 1
+            else:
+                inserted += 1
+
             mapping = {
                 "key": key,
                 "channel": channel,
@@ -180,22 +232,15 @@ def import_csvs(orders_file, items_file=None, batch_label: str = None) -> dict:
                 "sku_summary": item_info.get("sku_summary", ""),
                 "product_summary": item_info.get("product_summary", ""),
                 "qty_total": item_info.get("qty_total", 0),
+                # Only used on genuine INSERT — on conflict this column is
+                # excluded from the UPDATE SET clause, so an existing row's
+                # inspection progress is never reset by a re-import.
+                "inspection_status": "pending",
                 "import_batch": batch_label,
             }
-            if is_new:
-                mapping["inspection_status"] = "pending"
-                insert_mappings.append(mapping)
-                inserted += 1
-            else:
-                existing_insp = existing_keys.get(key)
-                mapping["inspection_status"] = existing_insp if existing_insp else "pending"
-                update_mappings.append(mapping)
-                updated += 1
+            mappings.append(mapping)
 
-        if insert_mappings:
-            session.bulk_insert_mappings(ReturnOrder, insert_mappings)
-        if update_mappings:
-            session.bulk_update_mappings(ReturnOrder, update_mappings)
+        _upsert_return_orders(session, mappings)
         session.commit()
     finally:
         session.close()
