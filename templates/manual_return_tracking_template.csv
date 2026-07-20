@@ -1,0 +1,2 @@
+brand,request_date,marketplace,order_id,return_id,reason_to_return,customer_comment,sku,quantity,amount,courier,tracking_no,return_delivered_date,warehouse_received,status
+AAFHU,2026-07-15,Shopee,2201234567890,RET-000123,Changed mind,Customer no longer wants item,SKU-BLK-M,1,450.00,Kerry Express,TH123456789,2026-07-18,2026-07-19,Open
