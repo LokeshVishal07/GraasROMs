@@ -79,106 +79,37 @@ def render():
                      "Return Date": st.column_config.DatetimeColumn(format="D MMM YYYY, h:mm a"),
                  })
 
+    # Same timing rule as nav_radio in app.py: session_state for a widget's
+    # key can only be overwritten BEFORE that widget is instantiated on a
+    # given run, never after. So the "snap back to Single order detail"
+    # reset has to happen here, ahead of st.radio() below, driven by a flag
+    # set on the previous run -- not by writing to "returns_mode" directly
+    # after picking "Bulk update" (that throws StreamlitAPIException).
+    if st.session_state.pop("_reset_returns_mode", False):
+        st.session_state["returns_mode"] = "Single order detail"
+
     if perms.get("inspect"):
         mode = st.radio("Mode", ["Single order detail", "Bulk update"], horizontal=True, key="returns_mode")
     else:
         mode = "Single order detail"
 
     if mode == "Bulk update":
-        _render_bulk_update(show)
-    else:
-        st.markdown("#### Order detail & warehouse inspection")
-        options = {row["key"]: _order_label(row) for _, row in show.iterrows()}
-        sel_key = st.selectbox("Select an order", list(options.keys()), format_func=lambda k: options[k])
-        if not sel_key:
-            return
-        row = show[show["key"] == sel_key].iloc[0]
-        _render_detail(row, perms)
+        # Bulk inspection updates now happen exclusively through the Excel
+        # template flow (WH Inspection Bulk Upload) -- jump there instead of
+        # rendering an in-page bulk editor. Flag the radio to reset on the
+        # next run so a later visit to Returns doesn't immediately bounce
+        # the user away again.
+        st.session_state["_reset_returns_mode"] = True
+        st.session_state["nav_target"] = "WH Inspection Bulk Upload"
+        st.rerun()
 
-
-def _render_bulk_update(show: pd.DataFrame):
-    st.markdown("#### Bulk warehouse inspection update")
-    st.caption("Select multiple returns and apply one inspection result to all of them at once.")
-
-    editable = show[["key", "order_id", "brand", "marketplace", "trigger_label", "inspection_status"]].copy()
-    editable.insert(0, "Select", False)
-    editable = editable.rename(columns={
-        "order_id": "Order ID", "brand": "Brand", "marketplace": "Marketplace",
-        "trigger_label": "MP Status", "inspection_status": "Current Status",
-    })
-    edited = st.data_editor(
-        editable, hide_index=True, width="stretch", height=320, key="bulk_editor",
-        disabled=["Order ID", "Brand", "Marketplace", "MP Status", "Current Status"],
-        column_config={"Select": st.column_config.CheckboxColumn(required=True)},
-    )
-    selected_keys = edited.loc[edited["Select"], "key"].tolist()
-    st.write(f"**{len(selected_keys)}** order(s) selected.")
-
-    if not selected_keys:
+    st.markdown("#### Order detail & warehouse inspection")
+    options = {row["key"]: _order_label(row) for _, row in show.iterrows()}
+    sel_key = st.selectbox("Select an order", list(options.keys()), format_func=lambda k: options[k])
+    if not sel_key:
         return
-
-    with st.form("bulk_update_form"):
-        warehouse = st.text_input("Warehouse (applies to all selected)", placeholder="e.g. Bangkok DC 1")
-        status = st.selectbox("Inspection Result", INSPECTION_OPTIONS[1:],
-                               format_func=lambda s: INSPECTION_LABELS[s])
-        comment = st.text_area("Comment (applies to all selected; required for Damaged / Not Received)")
-        damage_reason = st.text_input("Reason (if applicable)")
-        st.caption("Evidence — mandatory for Damaged / Not Received, optional for Refund Only. "
-                   "Provide a file upload, a cloud storage link, or both (applied to every selected order).")
-        evidence_files = st.file_uploader(
-            "Option 1 — Direct file upload", accept_multiple_files=True,
-            type=["png", "jpg", "jpeg", "webp", "gif", "mp4", "pdf"],
-        )
-        evidence_link = st.text_input("Option 2 — Google Drive / OneDrive / SharePoint link")
-        submitted = st.form_submit_button(f"Apply to {len(selected_keys)} order(s)", type="primary")
-
-    if not submitted:
-        return
-
-    if evidence_link.strip() and not is_probably_valid_link(evidence_link):
-        st.error("The evidence link doesn't look like a valid http(s) URL.")
-        return
-
-    if status in COMMENT_REQUIRED and not comment.strip():
-        st.error("Comment is required for Damaged / Not Received / Refund Only.")
-        return
-    if status in EVIDENCE_REQUIRED and not evidence_files and not evidence_link.strip():
-        st.error("Evidence is mandatory for Damaged / Not Received — upload a file or provide a link.")
-        return
-
-    session = get_session()
-    try:
-        user = current_user()
-        now = dt.datetime.utcnow()
-        for key in selected_keys:
-            order = session.get(ReturnOrder, key)
-            if order is None:
-                continue
-            if warehouse.strip():
-                order.warehouse = warehouse.strip()
-            order.inspection_status = status
-            order.inspection_comment = comment.strip()
-            if damage_reason.strip():
-                order.damage_reason = damage_reason.strip()
-            order.inspected_by = user["name"]
-            order.inspected_at = now
-            for f in (evidence_files or []):
-                session.add(Evidence(order_key=key, is_link=False, filename=f.name, content_type=f.type,
-                                      size=f.size, data=f.getvalue(), uploaded_by=user["name"],
-                                      uploaded_at=now))
-            session.commit()
-            if evidence_link.strip():
-                save_link(key, evidence_link.strip(), user["name"], when=now)
-            log_activity(order_key=key, action="Bulk inspection update",
-                          comment=f"Result: {status}" + (f" — {comment.strip()}" if comment.strip() else ""))
-            if status in COMMENT_REQUIRED:
-                push_notification("damaged", f"Order {order.order_id} needs Operations action ({status})", key)
-    finally:
-        session.close()
-
-    bump_cache_nonce()
-    st.success(f"Updated {len(selected_keys)} order(s).")
-    st.rerun()
+    row = show[show["key"] == sel_key].iloc[0]
+    _render_detail(row, perms)
 
 
 def _render_detail(row, perms):
