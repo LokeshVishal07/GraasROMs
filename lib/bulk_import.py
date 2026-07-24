@@ -80,12 +80,6 @@ CASES_NOT_REQUIRING_INSPECTION_BY_ORDER_STATUS = {
     "LOST_BY_3PL": "lost_scrap",
 }
 
-EXAMPLE_ROW = [
-    "2201234567890", "RET-000123", "Damaged", "Box crushed, item cracked on arrival",
-    "Physical damage in transit", "https://drive.google.com/file/d/example/view",
-    "2026-07-19", "Wichai Warehouse",
-]
-
 MAX_TEMPLATE_ROWS = 300
 
 
@@ -101,7 +95,6 @@ def build_template_bytes() -> bytes:
     header_fill = PatternFill("solid", fgColor="1F3864")
     header_font = Font(name=FONT_NAME, bold=True, color="FFFFFF", size=10)
     key_font = Font(name=FONT_NAME, italic=True, size=8, color="999999")
-    example_font = Font(name=FONT_NAME, italic=True, color="808080", size=10)
     normal_font = Font(name=FONT_NAME, size=10)
     thin = Side(style="thin", color="D9D9D9")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -121,11 +114,10 @@ def build_template_bytes() -> bytes:
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = border
 
-    ws.append(EXAMPLE_ROW)
-    for c in range(1, len(SYSTEM_COLUMNS) + 1):
-        cell = ws.cell(row=3, column=c)
-        cell.font = example_font
-        cell.border = border
+    # No example row anymore -- it was too easy to forget to delete before
+    # uploading, and a leftover example row (an order ID that doesn't exist
+    # in the system) always failed validation. Data now starts right at row 3.
+    DATA_START_ROW = 3
 
     # order_id / return_id are long numeric-looking strings (TikTok order IDs
     # run 18-19 digits). Without this, Excel/Sheets "helpfully" reformats a
@@ -135,8 +127,14 @@ def build_template_bytes() -> bytes:
     # anyone pastes into them is the actual fix; see also the apostrophe-
     # prefix fallback noted on the Instructions tab for manual entry.
     text_format_cols = {SYSTEM_COLUMNS.index("order_id") + 1, SYSTEM_COLUMNS.index("return_id") + 1}
+    # Same idea for Inspection Date -- without a preset Date format, pasting a
+    # date from another sheet can land as a raw serial number (e.g. 45905)
+    # instead of a readable date, and the only fix is reformatting the cell
+    # by hand after the fact. Presetting the column to a date format up front
+    # means a pasted date displays correctly right away.
+    date_format_col = SYSTEM_COLUMNS.index("inspection_date") + 1
 
-    for r in range(4, 4 + MAX_TEMPLATE_ROWS):
+    for r in range(DATA_START_ROW, DATA_START_ROW + MAX_TEMPLATE_ROWS):
         for c in range(1, len(SYSTEM_COLUMNS) + 1):
             cell = ws.cell(row=r, column=c)
             cell.font = normal_font
@@ -144,22 +142,22 @@ def build_template_bytes() -> bytes:
             cell.fill = yellow_fill
             if c in text_format_cols:
                 cell.number_format = "@"
-
-    for c in text_format_cols:
-        ws.cell(row=3, column=c).number_format = "@"
+            elif c == date_format_col:
+                cell.number_format = "YYYY-MM-DD"
 
     widths = [18, 14, 16, 28, 22, 30, 16, 20]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.row_dimensions[1].height = 12
     ws.row_dimensions[2].height = 30
-    ws.freeze_panes = "A4"
+    ws.freeze_panes = f"A{DATA_START_ROW}"
 
     status_col = SYSTEM_COLUMNS.index("inspection_status") + 1
     dv = DataValidation(type="list", formula1=f'"{",".join(STATUS_CHOICES_HUMAN)}"',
                          allow_blank=True, showDropDown=False)
     ws.add_data_validation(dv)
-    dv.add(f"{get_column_letter(status_col)}4:{get_column_letter(status_col)}{3 + MAX_TEMPLATE_ROWS}")
+    dv.add(f"{get_column_letter(status_col)}{DATA_START_ROW}:"
+           f"{get_column_letter(status_col)}{DATA_START_ROW - 1 + MAX_TEMPLATE_ROWS}")
 
     # Instructions sheet
     ins = wb.create_sheet("Instructions")
@@ -175,10 +173,10 @@ def build_template_bytes() -> bytes:
 
     ins["A3"] = "How this works"
     ins["A3"].font = bold
-    ins["A4"] = ("Fill in one row per return on the 'Bulk Inspection Upload' tab — one order per row. "
-                 "Delete the grey EXAMPLE row (row 3) before you finish. Fields marked with * are "
-                 "mandatory. The file is validated on upload; any problem rows are rejected with a "
-                 "downloadable error report, and only rows that pass validation are applied.")
+    ins["A4"] = ("Fill in one row per return on the 'Bulk Inspection Upload' tab — one order per row, "
+                 "starting at row 3. Fields marked with * are mandatory. The file is validated on "
+                 "upload; any problem rows are rejected with a downloadable error report, and only "
+                 "rows that pass validation are applied.")
     ins["A4"].alignment = Alignment(wrap_text=True)
     ins.merge_cells("A4:B4")
     ins.row_dimensions[4].height = 60
@@ -213,7 +211,9 @@ def build_template_bytes() -> bytes:
                               "Recommended for Damaged or Not Received, but not required — you can upload "
                               "without it. If left blank, the system notes \"Image missing\" in that "
                               "return's comments so Operations knows to follow up for evidence."),
-        ("inspection_date", "Date the item was inspected. Format: YYYY-MM-DD. Defaults to today if left blank."),
+        ("inspection_date", "Date the item was inspected. This column is pre-formatted as a Date "
+                             "(YYYY-MM-DD), so a pasted date should display correctly rather than "
+                             "turning into a raw number. Defaults to today if left blank."),
         ("warehouse_user_name", "Name of the warehouse staff who performed the inspection. Defaults to "
                                  "your logged-in name if left blank."),
     ]
@@ -318,7 +318,7 @@ def validate_upload(df: pd.DataFrame):
         by_key[key] = (trigger_code, order_status)
 
     for i, row in df.iterrows():
-        excel_row = i + 4  # data starts at physical row 4 (after key/header/example rows)
+        excel_row = i + 3  # data starts at physical row 3 (after the key row + human-label row)
         order_id = _clean(row["order_id"])
         return_id = _clean(row["return_id"])
         status_raw = _clean(row["inspection_status"])
