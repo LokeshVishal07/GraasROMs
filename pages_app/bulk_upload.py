@@ -2,11 +2,29 @@ import pandas as pd
 import streamlit as st
 
 from lib.auth import current_permissions, current_user
-from lib.data import bump_cache_nonce
+from lib.data import bump_cache_nonce, load_orders_df, cache_nonce
 from lib.bulk_import import (
     build_template_bytes, parse_uploaded_workbook, validate_upload,
     build_error_report_bytes, apply_bulk_upload, CODE_TO_LABEL,
 )
+
+
+def _pending_orders_for_template() -> list:
+    """Every order currently Pending Inspection, as {"order_id", "return_id"}
+    dicts, sorted with the oldest return_date first -- i.e. the ones closest
+    to (or already past) the 48h SLA come first in the downloaded template,
+    so the warehouse naturally works the most urgent ones first."""
+    df = load_orders_df(cache_nonce())
+    if df.empty:
+        return []
+    pending = df[df["inspection_status"] == "pending"].copy()
+    if pending.empty:
+        return []
+    pending = pending.sort_values("return_date", ascending=True, na_position="last")
+    return [
+        {"order_id": row["order_id"], "return_id": row["return_id"] or ""}
+        for _, row in pending.iterrows()
+    ]
 
 
 def render():
@@ -19,8 +37,14 @@ def render():
     st.caption("Process return inspections in bulk: download the template, fill in one row per "
                "order, then upload it here. Every row is validated before anything is saved.")
 
+    pending_orders = _pending_orders_for_template()
+    if pending_orders:
+        st.caption(f"📋 The template below comes pre-filled with all **{len(pending_orders)}** order(s) "
+                   f"currently Pending Inspection, sorted with the most SLA-urgent first — just fill in "
+                   f"the rest of each row.")
+
     st.download_button(
-        "⬇️ Download Template", data=build_template_bytes(),
+        "⬇️ Download Template", data=build_template_bytes(pending_orders),
         file_name="Warehouse_Bulk_Inspection_Template.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
