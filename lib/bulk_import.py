@@ -81,16 +81,29 @@ CASES_NOT_REQUIRING_INSPECTION_BY_ORDER_STATUS = {
 }
 
 MAX_TEMPLATE_ROWS = 300
+# Safety cap on how many pending orders get pre-filled into the template --
+# keeps the file from becoming unwieldy if the pending backlog is huge.
+MAX_PREFILL_ROWS = 3000
+# Extra blank rows appended after the pre-filled ones, for ad-hoc entries
+# that aren't already in the pending list.
+BLANK_BUFFER_ROWS = 20
 
 
 # --------------------------------------------------------------------------
 # Template
 # --------------------------------------------------------------------------
 
-def build_template_bytes() -> bytes:
+def build_template_bytes(pending_orders: list = None) -> bytes:
+    """pending_orders: optional list of {"order_id", "return_id"} dicts, already
+    sorted by whatever priority the caller wants (e.g. SLA urgency) -- these
+    get pre-filled into the Order ID / Return ID columns so the warehouse
+    doesn't have to look them up and type/paste them by hand. Any row beyond
+    that list is left blank for ad-hoc entries, same as before."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Bulk Inspection Upload"
+
+    pending_orders = pending_orders or []
 
     header_fill = PatternFill("solid", fgColor="1F3864")
     header_font = Font(name=FONT_NAME, bold=True, color="FFFFFF", size=10)
@@ -133,8 +146,17 @@ def build_template_bytes() -> bytes:
     # by hand after the fact. Presetting the column to a date format up front
     # means a pasted date displays correctly right away.
     date_format_col = SYSTEM_COLUMNS.index("inspection_date") + 1
+    order_id_col = SYSTEM_COLUMNS.index("order_id") + 1
+    return_id_col = SYSTEM_COLUMNS.index("return_id") + 1
 
-    for r in range(DATA_START_ROW, DATA_START_ROW + MAX_TEMPLATE_ROWS):
+    # Pre-filled rows for every pending order, capped so a huge backlog can't
+    # produce an unusably large file, plus extra blank rows on top for any
+    # ad-hoc entries that aren't already in the pending list.
+    prefill_count = min(len(pending_orders), MAX_PREFILL_ROWS)
+    total_rows = max(MAX_TEMPLATE_ROWS, prefill_count + BLANK_BUFFER_ROWS)
+
+    for r in range(DATA_START_ROW, DATA_START_ROW + total_rows):
+        idx = r - DATA_START_ROW
         for c in range(1, len(SYSTEM_COLUMNS) + 1):
             cell = ws.cell(row=r, column=c)
             cell.font = normal_font
@@ -144,6 +166,17 @@ def build_template_bytes() -> bytes:
                 cell.number_format = "@"
             elif c == date_format_col:
                 cell.number_format = "YYYY-MM-DD"
+        if idx < prefill_count:
+            po = pending_orders[idx]
+            ws.cell(row=r, column=order_id_col, value=str(po["order_id"]))
+            if po.get("return_id"):
+                ws.cell(row=r, column=return_id_col, value=str(po["return_id"]))
+            # Pre-filled rows aren't ad-hoc entries -- a light fill tells the
+            # warehouse "this one's already queued up for you" vs. the plain
+            # yellow blank rows below/after them.
+            prefilled_fill = PatternFill("solid", fgColor="FFF9C4")
+            ws.cell(row=r, column=order_id_col).fill = prefilled_fill
+            ws.cell(row=r, column=return_id_col).fill = prefilled_fill
 
     widths = [18, 14, 16, 28, 22, 30, 16, 20]
     for i, w in enumerate(widths, start=1):
@@ -157,7 +190,7 @@ def build_template_bytes() -> bytes:
                          allow_blank=True, showDropDown=False)
     ws.add_data_validation(dv)
     dv.add(f"{get_column_letter(status_col)}{DATA_START_ROW}:"
-           f"{get_column_letter(status_col)}{DATA_START_ROW - 1 + MAX_TEMPLATE_ROWS}")
+           f"{get_column_letter(status_col)}{DATA_START_ROW - 1 + total_rows}")
 
     # Instructions sheet
     ins = wb.create_sheet("Instructions")
@@ -174,9 +207,13 @@ def build_template_bytes() -> bytes:
     ins["A3"] = "How this works"
     ins["A3"].font = bold
     ins["A4"] = ("Fill in one row per return on the 'Bulk Inspection Upload' tab — one order per row, "
-                 "starting at row 3. Fields marked with * are mandatory. The file is validated on "
-                 "upload; any problem rows are rejected with a downloadable error report, and only "
-                 "rows that pass validation are applied.")
+                 "starting at row 3. Rows with a light-yellow Order ID / Return ID already filled in "
+                 "are every order currently Pending Inspection at the time this file was downloaded, "
+                 "sorted so the ones closest to (or past) the 48h SLA come first -- just fill in the "
+                 "rest of that row. Plain rows below/after those are blank for any other order you "
+                 "need to add. Fields marked with * are mandatory. The file is validated on upload; "
+                 "any problem rows are rejected with a downloadable error report, and only rows that "
+                 "pass validation are applied.")
     ins["A4"].alignment = Alignment(wrap_text=True)
     ins.merge_cells("A4:B4")
     ins.row_dimensions[4].height = 60
